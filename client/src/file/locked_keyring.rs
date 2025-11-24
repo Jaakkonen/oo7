@@ -54,6 +54,15 @@ impl LockedKeyring {
         self.keyring.read().await.modified_time()
     }
 
+    /// Check if this keyring uses GPG encryption.
+    ///
+    /// Returns `true` if the keyring is encrypted with GPG, `false` if it uses
+    /// password-based encryption.
+    pub async fn is_gpg_encrypted(&self) -> bool {
+        let keyring = self.keyring.read().await;
+        keyring.gpg_config.is_some()
+    }
+
     /// Retrieve the list of available [`LockedItem`]s without decrypting them.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     pub async fn items(&self) -> Result<Vec<Result<Item, InvalidItemError>>, Error> {
@@ -85,6 +94,76 @@ impl LockedKeyring {
         self.unlock_inner(secret, false).await
     }
 
+    /// Unlocks a GPG-encrypted keyring and validates it.
+    ///
+    /// This method requires the keyring to use GPG encryption and will prompt
+    /// for Yubikey touch/PIN via gpg-agent.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
+    pub async fn unlock_with_gpg(self) -> Result<UnlockedKeyring, Error> {
+        self.unlock_with_gpg_inner(true).await
+    }
+
+    /// Unlocks a GPG-encrypted keyring without validating it.
+    ///
+    /// # Safety
+    ///
+    /// The method doesn't validate that the decrypted master key can decrypt
+    /// all the items in the keyring.
+    pub async unsafe fn unlock_with_gpg_unchecked(self) -> Result<UnlockedKeyring, Error> {
+        self.unlock_with_gpg_inner(false).await
+    }
+
+    async fn unlock_with_gpg_inner(
+        self,
+        validate_items: bool,
+    ) -> Result<UnlockedKeyring, Error> {
+        use crate::crypto::gpg;
+
+        let key = if validate_items {
+            let inner_keyring = self.keyring.read().await;
+
+            // Check if the keyring uses GPG encryption
+            let config = inner_keyring.gpg_config.as_ref()
+                .ok_or(Error::NotGpgEncrypted)?;
+
+            #[cfg(feature = "tracing")]
+            tracing::debug!("Decrypting master key with GPG key: {}", config.gpg_key_id);
+
+            let encrypted_master_key = config.encrypted_master_key.clone();
+
+            // Decrypt the master key using GPG (this will trigger Yubikey interaction)
+            // Run on a blocking thread to avoid runtime issues
+            let master_key_bytes = tokio::task::spawn_blocking(move || {
+                gpg::decrypt_session_key(&encrypted_master_key)
+            })
+            .await
+            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
+
+            // Convert to Key type
+            let key = crate::Key::new(master_key_bytes.to_vec());
+
+            // Validate items can be decrypted with this key
+            inner_keyring.validate_key(&key)?;
+            drop(inner_keyring);
+
+            Some(Arc::new(key))
+        } else {
+            None
+        };
+
+        // For GPG-encrypted keyrings, we don't have a traditional "secret" (password)
+        // So we use an empty secret as a placeholder
+        let placeholder_secret = Secret::text("");
+
+        Ok(UnlockedKeyring {
+            keyring: self.keyring,
+            path: self.path,
+            mtime: self.mtime,
+            key: Mutex::new(key),
+            secret: Mutex::new(Arc::new(placeholder_secret)),
+        })
+    }
+
     async fn unlock_inner(
         self,
         secret: Secret,
@@ -95,38 +174,9 @@ impl LockedKeyring {
 
             let key = inner_keyring.derive_key(&secret)?;
 
-            let mut n_broken_items = 0;
-            let mut n_valid_items = 0;
-            for encrypted_item in &inner_keyring.items {
-                if encrypted_item.clone().decrypt(&key).is_err() {
-                    n_broken_items += 1;
-                } else {
-                    n_valid_items += 1;
-                }
-            }
-
+            // Validate items can be decrypted with this key
+            inner_keyring.validate_key(&key)?;
             drop(inner_keyring);
-
-            if n_valid_items == 0 && n_broken_items != 0 {
-                #[cfg(feature = "tracing")]
-                tracing::error!("Keyring cannot be decrypted. Invalid secret.");
-                return Err(Error::IncorrectSecret);
-            } else if n_broken_items > n_valid_items {
-                #[cfg(feature = "tracing")]
-                {
-                    tracing::warn!(
-                        "The file contains {n_broken_items} broken items and {n_valid_items} valid ones."
-                    );
-                    tracing::info!(
-                        "Please switch to `UnlockedKeyring::load_unchecked` to load the keyring without the secret validation.
-                        `Keyring::delete_broken_items` can be used to remove them or alternatively with `oo7-cli --repair`."
-                    );
-                }
-                return Err(Error::PartiallyCorruptedKeyring {
-                    valid_items: n_valid_items,
-                    broken_items: n_broken_items,
-                });
-            }
             Some(Arc::new(key))
         } else {
             None

@@ -1,5 +1,6 @@
 mod capability;
 mod collection;
+mod config;
 mod error;
 #[allow(unused)]
 mod gnome;
@@ -55,6 +56,15 @@ enum ShouldErrorOut {
 async fn inner_main(args: Args) -> Result<(), Error> {
     capability::drop_unnecessary_capabilities()?;
 
+    // Load configuration
+    let config = config::Config::load_from_standard_locations();
+
+    // Validate configuration
+    if let Err(e) = config.validate() {
+        tracing::error!("Configuration validation failed: {}", e);
+        return Err(Error::ConfigError(e));
+    }
+
     let secret_info = if args.login {
         let mut stdin = std::io::stdin().lock();
         if stdin.is_terminal() {
@@ -96,7 +106,7 @@ async fn inner_main(args: Args) -> Result<(), Error> {
     tracing::info!("Starting {BINARY_NAME}");
 
     if let Some((secret, should_error_out)) = secret_info {
-        let res = Service::run(Some(secret), args.replace).await;
+        let res = Service::run(Some(secret), args.replace, config).await;
         match res {
             Ok(()) => (),
             // Wrong password provided via system credentials
@@ -116,7 +126,7 @@ async fn inner_main(args: Args) -> Result<(), Error> {
             Err(err) => Err(err)?,
         }
     } else {
-        Service::run(None, args.replace).await?;
+        Service::run(None, args.replace, config).await?;
     }
 
     tracing::debug!("Starting loop");

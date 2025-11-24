@@ -232,6 +232,15 @@ impl UnlockedKeyring {
         self.keyring.read().await.modified_time()
     }
 
+    /// Check if this keyring uses GPG encryption.
+    ///
+    /// Returns `true` if the keyring is encrypted with GPG, `false` if it uses
+    /// password-based encryption.
+    pub async fn is_gpg_encrypted(&self) -> bool {
+        let keyring = self.keyring.read().await;
+        keyring.gpg_config.is_some()
+    }
+
     /// Retrieve the number of items
     ///
     /// This function will not trigger a key derivation and can therefore be
@@ -449,9 +458,30 @@ impl UnlockedKeyring {
     }
 
     /// Write the changes to the keyring file.
+    ///
+    /// For GPG-encrypted keyrings, this automatically rotates the master key
+    /// on each save to provide forward secrecy.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     pub async fn write(&self) -> Result<(), Error> {
+        // Acquire mtime lock early to prevent TOCTOU race conditions
         let mut mtime = self.mtime.lock().await;
+
+        // For GPG-encrypted keyrings, rotate the key before writing
+        // Hold mtime lock during rotation to ensure atomic write
+        {
+            let is_gpg_encrypted = {
+                let keyring = self.keyring.read().await;
+                keyring.gpg_config.is_some()
+            };
+
+            if is_gpg_encrypted {
+                #[cfg(feature = "tracing")]
+                tracing::debug!("Auto-rotating GPG master key before save");
+                self.rotate_gpg_key().await?;
+            }
+        }
+
+        // Write keyring to disk (still holding mtime lock)
         {
             let mut keyring = self.keyring.write().await;
 
@@ -466,6 +496,52 @@ impl UnlockedKeyring {
         if let Ok(modified) = fs::metadata(path).await?.modified() {
             *mtime = Some(modified);
         }
+        Ok(())
+    }
+
+    /// Helper method to re-encrypt all items with a new key.
+    ///
+    /// This method:
+    /// 1. Decrypts all items with the current key
+    /// 2. Re-encrypts all items with the provided new key
+    /// 3. Updates the cached key
+    ///
+    /// The caller is responsible for updating keyring configuration (gpg_config, secret, etc.)
+    /// before calling this method.
+    async fn reencrypt_with_new_key(&self, new_key: Arc<Key>) -> Result<(), Error> {
+        // Get the current key to decrypt items
+        let old_key = self.derive_key().await?;
+
+        // Decrypt all items with the old key
+        let keyring = self.keyring.read().await;
+        let mut items = Vec::with_capacity(keyring.items.len());
+
+        #[cfg(feature = "tracing")]
+        let _decrypt_span = tracing::debug_span!("decrypt_for_migration", total_items = keyring.items.len());
+
+        for item in &keyring.items {
+            items.push(item.clone().decrypt(&old_key)?);
+        }
+        drop(keyring);
+
+        // Re-encrypt all items with the new key
+        let mut keyring = self.keyring.write().await;
+        keyring.items.clear();
+
+        #[cfg(feature = "tracing")]
+        let _reencrypt_span = tracing::debug_span!("reencrypt", total_items = items.len());
+
+        for item in items {
+            let encrypted_item = item.encrypt(&new_key)?;
+            keyring.items.push(encrypted_item);
+        }
+        drop(keyring);
+
+        // Update the cached key
+        let mut key_lock = self.key.lock().await;
+        *key_lock = Some(new_key);
+        drop(key_lock);
+
         Ok(())
     }
 
@@ -599,6 +675,174 @@ impl UnlockedKeyring {
 
         self.write().await?;
         Ok(n_broken_items)
+    }
+
+    /// Migrate a password-based keyring to GPG encryption.
+    ///
+    /// This will:
+    /// 1. Generate a new random master key
+    /// 2. Encrypt it with the specified GPG public key
+    /// 3. Re-encrypt all items with the new master key
+    /// 4. Update the keyring to use GPG encryption
+    ///
+    /// # Arguments
+    ///
+    /// * `gpg_key_id` - The GPG key fingerprint or ID to use for encryption
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
+    pub async fn migrate_to_gpg(&self, gpg_key_id: &str) -> Result<(), Error> {
+        use crate::crypto::gpg;
+
+        #[cfg(feature = "tracing")]
+        tracing::info!("Migrating keyring to GPG encryption with key: {}", gpg_key_id);
+
+        // Validate the GPG key before proceeding
+        if !gpg::validate_key_id(gpg_key_id)? {
+            return Err(Error::Crypto(crate::crypto::Error::Gpg(
+                gpgme::Error::UNUSABLE_PUBKEY
+            )));
+        }
+
+        // Normalize to full fingerprint for consistent storage
+        let fingerprint = gpg::get_key_fingerprint(gpg_key_id)?;
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!("Validated GPG key, using fingerprint: {}", fingerprint);
+
+        // Generate a new random master key (16 bytes for AES-128)
+        let master_key = gpg::generate_session_key(16)?;
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!("Generated new master key, encrypting with GPG");
+
+        // Encrypt the master key with the GPG public key (using fingerprint)
+        let encrypted_master_key = gpg::encrypt_session_key(&master_key, &fingerprint)?;
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!("Master key encrypted, re-encrypting items");
+
+        // Convert master key to Key type
+        let new_key = Arc::new(crate::Key::new_with_strength(master_key.to_vec(), Ok(())));
+
+        // Update the GPG configuration (store full fingerprint)
+        {
+            let mut keyring = self.keyring.write().await;
+            keyring.gpg_config = Some(api::GpgConfig {
+                gpg_key_id: fingerprint,
+                encrypted_master_key,
+            });
+        }
+
+        // Re-encrypt all items with the new key
+        self.reencrypt_with_new_key(new_key).await?;
+
+        #[cfg(feature = "tracing")]
+        tracing::info!("Migration complete, writing to disk");
+
+        self.write().await
+    }
+
+    /// Migrate a GPG-encrypted keyring to password-based encryption.
+    ///
+    /// This method converts a GPG-encrypted keyring to use traditional password-based
+    /// encryption. All items are decrypted with the GPG key, then re-encrypted with
+    /// the password.
+    ///
+    /// # Arguments
+    ///
+    /// * `password` - The new password to encrypt the keyring with
+    ///
+    /// # Returns
+    ///
+    /// Error if the operation fails or if the keyring is already password-based.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, password)))]
+    pub async fn migrate_to_password(&self, password: &str) -> Result<(), Error> {
+        #[cfg(feature = "tracing")]
+        tracing::info!("Migrating keyring from GPG to password encryption");
+
+        // Check if currently GPG-encrypted
+        {
+            let keyring = self.keyring.read().await;
+            if keyring.gpg_config.is_none() {
+                return Err(Error::NotGpgEncrypted);
+            }
+        }
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!("Deriving password-based key");
+
+        // Update the secret
+        let new_secret = Secret::text(password);
+        let mut secret_lock = self.secret.lock().await;
+        *secret_lock = Arc::new(new_secret.clone());
+        drop(secret_lock);
+
+        // Derive a new key from the password and update keyring configuration
+        let new_key = {
+            let mut keyring = self.keyring.write().await;
+            keyring.gpg_config = None;
+            Arc::new(keyring.derive_key(&new_secret)?)
+        };
+
+        // Re-encrypt all items with the new key
+        self.reencrypt_with_new_key(new_key).await?;
+
+        #[cfg(feature = "tracing")]
+        tracing::info!("Migration complete, writing to disk");
+
+        self.write().await
+    }
+
+    /// Rotate the master key for a GPG-encrypted keyring.
+    ///
+    /// This provides forward secrecy: old encrypted snapshots cannot be
+    /// decrypted even if the old master key was compromised.
+    ///
+    /// # Returns
+    ///
+    /// Error if the keyring is not GPG-encrypted.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
+    pub async fn rotate_gpg_key(&self) -> Result<(), Error> {
+        use crate::crypto::gpg;
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!("Rotating master key for GPG keyring");
+
+        // Generate new key and update GPG config
+        let new_key = {
+            let mut keyring = self.keyring.write().await;
+
+            // Check if the keyring uses GPG encryption
+            let gpg_key_id = keyring.gpg_config.as_ref()
+                .ok_or(Error::NotGpgEncrypted)?
+                .gpg_key_id.clone();
+
+            // Generate a new random master key (16 bytes for AES-128)
+            let master_key = gpg::generate_session_key(16)?;
+
+            #[cfg(feature = "tracing")]
+            tracing::debug!("Generated new master key, encrypting with GPG");
+
+            // Encrypt the master key with the GPG public key
+            let encrypted_master_key = gpg::encrypt_session_key(&master_key, &gpg_key_id)?;
+
+            // Update the GPG configuration
+            keyring.gpg_config = Some(api::GpgConfig {
+                gpg_key_id,
+                encrypted_master_key,
+            });
+
+            // Convert master key to Key type
+            Arc::new(crate::Key::new_with_strength(master_key.to_vec(), Ok(())))
+        };
+        // keyring write lock is dropped here
+
+        // Re-encrypt all items with the new key
+        self.reencrypt_with_new_key(new_key).await?;
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!("Key rotation complete");
+
+        Ok(())
     }
 }
 

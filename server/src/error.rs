@@ -18,6 +18,8 @@ pub enum Error {
     InvalidItem(oo7::file::InvalidItemError),
     // Capability error
     Capability(capability::Error),
+    // Config error
+    ConfigError(crate::config::ConfigError),
 }
 
 impl std::error::Error for Error {}
@@ -55,6 +57,7 @@ impl fmt::Display for Error {
             Self::EmptyPassword => write!(f, "Login password can't be empty"),
             Self::InvalidItem(err) => write!(f, "Item cannot be decrypted {err}"),
             Self::Capability(err) => write!(f, "Capability error {err}"),
+            Self::ConfigError(err) => write!(f, "Configuration error: {err}"),
         }
     }
 }

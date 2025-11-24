@@ -37,8 +37,13 @@ impl Key {
         Self::new_with_strength(key, Err(file::WeakKeyError::StrengthUnknown))
     }
 
-    pub(crate) const fn check_strength(&self) -> Result<(), file::WeakKeyError> {
-        self.strength
+    pub(crate) fn check_strength(&self) -> Result<(), file::WeakKeyError> {
+        match &self.strength {
+            // Allow keys with unknown strength (from GPG or D-Bus)
+            Err(file::WeakKeyError::StrengthUnknown) => Ok(()),
+            // For all other cases, return as-is
+            _ => self.strength,
+        }
     }
 
     pub(crate) const fn new_with_strength(

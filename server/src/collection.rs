@@ -45,7 +45,27 @@ impl Collection {
     pub async fn delete(&self) -> Result<OwnedObjectPath, ServiceError> {
         // Check if collection is locked
         if self.is_locked().await {
-            // Create a prompt to unlock and delete the collection
+            // Check if this is a GPG-encrypted keyring
+            let keyring_guard = self.keyring.read().await;
+            let is_gpg = if let Some(Keyring::Locked(locked_kr)) = keyring_guard.as_ref() {
+                locked_kr.is_gpg_encrypted().await
+            } else {
+                false
+            };
+            drop(keyring_guard);
+
+            if is_gpg {
+                // GPG keyring - unlock directly without prompt
+                tracing::debug!(
+                    "Unlocking GPG-encrypted collection `{}` for delete",
+                    self.path
+                );
+                self.set_locked(false, None).await?;
+                self.delete_unlocked().await?;
+                return Ok(OwnedObjectPath::default());
+            }
+
+            // Password-based keyring - create a prompt to unlock and delete the collection
             let prompt = crate::prompt::Prompt::new(
                 self.service.clone(),
                 crate::prompt::PromptRole::Unlock,
@@ -166,7 +186,27 @@ impl Collection {
         replace: bool,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), ServiceError> {
         if self.is_locked().await {
-            // Create a prompt to unlock the collection and create the item
+            // Check if this is a GPG-encrypted keyring
+            let keyring_guard = self.keyring.read().await;
+            let is_gpg = if let Some(Keyring::Locked(locked_kr)) = keyring_guard.as_ref() {
+                locked_kr.is_gpg_encrypted().await
+            } else {
+                false
+            };
+            drop(keyring_guard);
+
+            if is_gpg {
+                // GPG keyring - unlock directly without prompt
+                tracing::debug!(
+                    "Unlocking GPG-encrypted collection `{}` for create_item",
+                    self.path
+                );
+                self.set_locked(false, None).await?;
+                let item_path = self.create_item_unlocked(properties, secret, replace).await?;
+                return Ok((item_path, OwnedObjectPath::default()));
+            }
+
+            // Password-based keyring - create a prompt to unlock the collection and create the item
             let prompt = crate::prompt::Prompt::new(
                 self.service.clone(),
                 crate::prompt::PromptRole::Unlock,
@@ -488,24 +528,61 @@ impl Collection {
                     Keyring::Locked(unlocked.lock())
                 }
                 (Keyring::Locked(locked_kr), false) => {
-                    let secret = secret.ok_or_else(|| {
-                        custom_service_error("Cannot unlock collection without a secret")
-                    })?;
-
                     let keyring_path = locked_kr.path().map(|p| p.to_path_buf());
 
-                    let unlocked = match locked_kr.unlock(secret).await {
-                        Ok(unlocked) => unlocked,
-                        Err(err) => {
-                            // Reload the locked keyring from disk before returning error
-                            if let Some(path) = keyring_path {
-                                if let Ok(reloaded) = oo7::file::LockedKeyring::load(&path).await {
-                                    *keyring_guard = Some(Keyring::Locked(reloaded));
+                    // Check if this is a GPG-encrypted keyring
+                    let is_gpg = locked_kr.is_gpg_encrypted().await;
+
+                    let unlocked = if is_gpg {
+                        // Send notification about keyring access
+                        let label = self.label.lock().await.clone();
+
+                        // Run notification in blocking thread to avoid nested runtime
+                        let _ = tokio::task::spawn_blocking(move || {
+                            notify_rust::Notification::new()
+                                .summary("Keyring Access")
+                                .body(&format!("Accessing keyring '{}' via Yubikey GPG", label))
+                                .timeout(notify_rust::Timeout::Milliseconds(3000))
+                                .show()
+                        })
+                        .await;
+
+                        tracing::info!("Unlocking GPG-encrypted keyring via Yubikey");
+
+                        // Unlock with GPG (will trigger Yubikey interaction via gpg-agent)
+                        match locked_kr.unlock_with_gpg().await {
+                            Ok(unlocked) => unlocked,
+                            Err(err) => {
+                                // Reload the locked keyring from disk before returning error
+                                if let Some(path) = keyring_path {
+                                    if let Ok(reloaded) = oo7::file::LockedKeyring::load(&path).await {
+                                        *keyring_guard = Some(Keyring::Locked(reloaded));
+                                    }
                                 }
+                                return Err(custom_service_error(&format!(
+                                    "Failed to unlock GPG keyring: {err}"
+                                )));
                             }
-                            return Err(custom_service_error(&format!(
-                                "Failed to unlock keyring: {err}"
-                            )));
+                        }
+                    } else {
+                        // Password-based unlock
+                        let secret = secret.ok_or_else(|| {
+                            custom_service_error("Cannot unlock collection without a secret")
+                        })?;
+
+                        match locked_kr.unlock(secret).await {
+                            Ok(unlocked) => unlocked,
+                            Err(err) => {
+                                // Reload the locked keyring from disk before returning error
+                                if let Some(path) = keyring_path {
+                                    if let Ok(reloaded) = oo7::file::LockedKeyring::load(&path).await {
+                                        *keyring_guard = Some(Keyring::Locked(reloaded));
+                                    }
+                                }
+                                return Err(custom_service_error(&format!(
+                                    "Failed to unlock keyring: {err}"
+                                )));
+                            }
                         }
                     };
 
@@ -524,13 +601,30 @@ impl Collection {
 
         drop(keyring_guard);
 
-        // Emit signals
-        let signal_emitter = self.service.signal_emitter(&self.path)?;
-        self.locked_changed(&signal_emitter).await?;
+        // Emit signals - don't fail the unlock if signal emission fails
+        // The keyring has already been successfully unlocked at this point
+        match self.service.signal_emitter(&self.path) {
+            Ok(signal_emitter) => {
+                if let Err(e) = self.locked_changed(&signal_emitter).await {
+                    tracing::warn!("Failed to emit locked_changed signal for {}: {}", self.path, e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get signal emitter for {}: {}", self.path, e);
+            }
+        }
 
         let service_path = oo7::dbus::api::Service::PATH.as_ref().unwrap();
-        let signal_emitter = self.service.signal_emitter(service_path)?;
-        Service::collection_changed(&signal_emitter, &self.path).await?;
+        match self.service.signal_emitter(service_path) {
+            Ok(signal_emitter) => {
+                if let Err(e) = Service::collection_changed(&signal_emitter, &self.path).await {
+                    tracing::warn!("Failed to emit collection_changed signal: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get signal emitter for service path: {}", e);
+            }
+        }
 
         tracing::debug!(
             "Collection: {} is {}.",

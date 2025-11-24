@@ -151,6 +151,76 @@ enum Commands {
 
     #[command(name = "repair", about = "Repair the keyring")]
     Repair,
+
+    #[command(name = "list-gpg-keys", about = "List available GPG keys for encryption")]
+    ListGpgKeys,
+
+    #[command(
+        name = "change-encryption",
+        about = "Change keyring encryption method",
+        after_help = format!("{H_STYLE}Examples:{H_STYLE:#}\n  {} change-encryption --to-gpg user@example.com\n  {} change-encryption --to-password", BINARY_NAME, BINARY_NAME)
+    )]
+    ChangeEncryption {
+        #[arg(long, help = "Change to GPG encryption with specified key ID", conflicts_with = "to_password")]
+        to_gpg: Option<String>,
+
+        #[arg(long, help = "Change to password-based encryption", conflicts_with = "to_gpg")]
+        to_password: bool,
+    },
+
+    #[command(
+        name = "dbus-list",
+        about = "List all collections and items via D-Bus",
+        after_help = format!("{H_STYLE}Example:{H_STYLE:#}\n  {} dbus-list", BINARY_NAME)
+    )]
+    DbusList {
+        #[arg(long, help = "Show secrets (WARNING: prints secrets to terminal)")]
+        show_secrets: bool,
+        #[arg(long, help = "Unlock locked collections before listing")]
+        unlock: bool,
+    },
+
+    #[command(
+        name = "dbus-get",
+        about = "Get a secret via D-Bus",
+        after_help = format!("{H_STYLE}Examples:{H_STYLE:#}\n  {} dbus-get smtp-port=1025\n  {} dbus-get --collection Yubikey_test app=test", BINARY_NAME, BINARY_NAME)
+    )]
+    DbusGet {
+        #[arg(long, help = "Collection name (default: 'default' alias)")]
+        collection: Option<String>,
+        #[arg(
+            help = "List of attributes. This is a space-separated list of pairs key=value",
+            value_parser = parse_key_val::<String, String>,
+            required = true,
+            num_args = 1
+        )]
+        attributes: Vec<(String, String)>,
+        #[arg(long, help = "Print only the secret.")]
+        secret_only: bool,
+        #[arg(long, help = "Print the secret in hexadecimal.")]
+        hex: bool,
+    },
+
+    #[command(
+        name = "dbus-set",
+        about = "Store a secret via D-Bus",
+        after_help = format!("The contents of the secret will be asked afterwards or read from stdin.\n\n{H_STYLE}Examples:{H_STYLE:#}\n  {} dbus-set 'My Secret' app=myapp type=password\n  {} dbus-set --collection Yubikey_test 'Test Item' app=test", BINARY_NAME, BINARY_NAME)
+    )]
+    DbusSet {
+        #[arg(long, help = "Collection name (default: 'default' alias)")]
+        collection: Option<String>,
+        #[arg(help = "Description for the secret")]
+        label: String,
+        #[arg(
+            help = "List of attributes. This is a space-separated list of pairs key=value",
+            value_parser = parse_key_val::<String, String>,
+            required = true,
+            num_args = 1
+        )]
+        attributes: Vec<(String, String)>,
+        #[arg(long, help = "Replace existing item with same attributes")]
+        replace: bool,
+    },
 }
 
 impl Commands {
@@ -204,8 +274,14 @@ impl Commands {
             (Some(path), Some(secret)) => unsafe {
                 Keyring::File(oo7::file::UnlockedKeyring::load_unchecked(path, secret).await?)
             },
-            (Some(_), None) => {
-                return Err(Error::new("A keyring requires a secret."));
+            (Some(keyring_path), None) => {
+                // Try loading as GPG keyring
+                let locked = oo7::file::LockedKeyring::load(&keyring_path).await?;
+                if locked.is_gpg_encrypted().await {
+                    Keyring::File(locked.unlock_with_gpg().await?)
+                } else {
+                    return Err(Error::new("Password-based keyrings require --secret parameter."));
+                }
             }
             (None, Some(_)) => {
                 return Err(Error::new("A secret requires a keyring."));
@@ -352,6 +428,315 @@ impl Commands {
                     return Err(Error::new("Only a keyring file can be repaired."));
                 }
             },
+            Commands::ListGpgKeys => {
+                use oo7::crypto::gpg;
+                let keys = gpg::list_gpg_keys()
+                    .map_err(|e| Error::Owned(format!("Failed to list GPG keys: {}", e)))?;
+
+                if keys.is_empty() {
+                    println!("No GPG keys found");
+                } else {
+                    println!("Available GPG keys:");
+                    for (key_id, user_id, has_secret) in keys {
+                        let key_type = if has_secret { "sec" } else { "pub" };
+                        println!("  [{key_type}] {key_id}");
+                        println!("       {user_id}");
+                    }
+                }
+            }
+            Commands::ChangeEncryption { to_gpg, to_password } => {
+                match keyring {
+                    Keyring::File(keyring) => {
+                        if to_gpg.is_none() && !to_password {
+                            return Err(Error::new("Must specify either --to-gpg or --to-password"));
+                        }
+
+                        let items = keyring.items().await?;
+                        let item_count = items.len();
+                        let is_currently_gpg = keyring.is_gpg_encrypted().await;
+
+                        // Determine the operation
+                        if let Some(gpg_key) = to_gpg {
+                            // Changing to GPG encryption
+                            if is_currently_gpg {
+                                println!("Changing GPG encryption key");
+                                println!("Current: GPG-encrypted");
+                                println!("New: GPG key {}", gpg_key);
+                            } else {
+                                println!("Migrating from password to GPG encryption");
+                                println!("New: GPG key {}", gpg_key);
+                            }
+
+                            println!("Found {} item(s) to re-encrypt", item_count);
+                            println!("\nThe GPG key must have encryption capabilities.");
+                            print!("Continue? [y/N] ");
+                            std::io::stdout().flush()?;
+
+                            let mut input = String::new();
+                            std::io::stdin().read_line(&mut input)?;
+                            if !input.trim().eq_ignore_ascii_case("y") {
+                                println!("Operation cancelled");
+                                return Ok(());
+                            }
+
+                            println!("\nChanging encryption...");
+                            println!("You may be prompted to touch your Yubikey and enter your PIN.");
+
+                            keyring.migrate_to_gpg(&gpg_key).await.map_err(|e| {
+                                Error::Owned(format!("Encryption change failed: {}", e))
+                            })?;
+
+                            println!("✓ Encryption changed successfully!");
+                            println!("\nThe keyring is now encrypted with GPG key: {}", gpg_key);
+                            println!("Future access will require your Yubikey and PIN.");
+
+                            if let Some(path) = keyring.path() {
+                                println!("\nOriginal keyring saved to: {}.bak", path.display());
+                            }
+                        } else if to_password {
+                            // Changing to password encryption
+                            if !is_currently_gpg {
+                                return Err(Error::new("Keyring is already password-encrypted"));
+                            }
+
+                            println!("Migrating from GPG to password encryption");
+                            println!("Found {} item(s) to re-encrypt", item_count);
+
+                            // Prompt for new password
+                            print!("\nEnter new password: ");
+                            std::io::stdout().flush()?;
+                            let password = rpassword::read_password()
+                                .map_err(|_| Error::new("Failed to read password"))?;
+
+                            print!("Confirm password: ");
+                            std::io::stdout().flush()?;
+                            let password_confirm = rpassword::read_password()
+                                .map_err(|_| Error::new("Failed to read password"))?;
+
+                            if password != password_confirm {
+                                return Err(Error::new("Passwords do not match"));
+                            }
+
+                            if password.len() < 8 {
+                                return Err(Error::new("Password must be at least 8 characters"));
+                            }
+
+                            print!("\nContinue? [y/N] ");
+                            std::io::stdout().flush()?;
+
+                            let mut input = String::new();
+                            std::io::stdin().read_line(&mut input)?;
+                            if !input.trim().eq_ignore_ascii_case("y") {
+                                println!("Operation cancelled");
+                                return Ok(());
+                            }
+
+                            println!("\nChanging encryption...");
+
+                            // Use migrate_to_password method
+                            keyring.migrate_to_password(&password).await.map_err(|e| {
+                                Error::Owned(format!("Encryption change failed: {}", e))
+                            })?;
+
+                            println!("✓ Encryption changed successfully!");
+                            println!("\nThe keyring is now encrypted with a password.");
+
+                            if let Some(path) = keyring.path() {
+                                println!("\nOriginal keyring saved to: {}.bak", path.display());
+                            }
+                        }
+                    }
+                    Keyring::Collection(_) => {
+                        return Err(Error::new("Only file-based keyrings can change encryption. Use --keyring option."));
+                    }
+                }
+            }
+
+            Commands::DbusList { show_secrets, unlock } => {
+                let collections = service.collections().await?;
+
+                for collection in collections {
+                    let label = collection.label().await?;
+                    let path = collection.path();
+                    let mut is_locked = collection.is_locked().await?;
+
+                    println!("\nCollection: {}", label);
+                    println!("  Path: {}", path);
+                    println!("  Locked: {}", is_locked);
+
+                    // Try to unlock if requested
+                    if is_locked && unlock {
+                        match collection.unlock(None).await {
+                            Ok(()) => {
+                                is_locked = false;
+                                println!("  (Unlocked successfully)");
+                            }
+                            Err(e) => {
+                                println!("  (Failed to unlock: {})", e);
+                            }
+                        }
+                    }
+
+                    if !is_locked {
+                        let items = collection.items().await?;
+                        println!("  Items: {}", items.len());
+
+                        for item in items {
+                            let item_label = item.label().await?;
+                            let attributes = item.attributes().await?;
+
+                            println!("\n  Item: {}", item_label);
+                            println!("    Path: {}", item.path());
+                            print!("    Attributes:");
+                            for (key, value) in &attributes {
+                                print!(" {}={}", key, value);
+                            }
+                            println!();
+
+                            if show_secrets {
+                                let secret = item.secret().await?;
+                                println!("    Secret: {}", String::from_utf8_lossy(secret.as_bytes()));
+                            }
+                        }
+                    } else {
+                        println!("  (Collection is locked - unlock to see items)");
+                    }
+                }
+            }
+
+            Commands::DbusGet {
+                collection: collection_name,
+                attributes,
+                secret_only,
+                hex,
+            } => {
+                let collection = if let Some(name) = collection_name {
+                    // Try alias first, then search by label
+                    if let Some(coll) = service.with_alias(&name).await? {
+                        coll
+                    } else {
+                        // Search by label
+                        let collections = service.collections().await?;
+                        let mut found_collection = None;
+                        for c in collections {
+                            if c.label().await.ok().as_ref() == Some(&name) {
+                                found_collection = Some(c);
+                                break;
+                            }
+                        }
+                        found_collection
+                            .ok_or_else(|| Error::Owned(format!("Collection '{}' not found", name)))?
+                    }
+                } else {
+                    service.default_collection().await?
+                };
+
+                // Unlock if needed
+                if collection.is_locked().await? {
+                    collection.unlock(None).await?;
+                }
+
+                let attr_map: HashMap<&str, &str> = attributes
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+
+                let items = collection.search_items(&attr_map).await?;
+
+                if items.is_empty() {
+                    println!("No items found with the given attributes");
+                    return Ok(());
+                }
+
+                let item = &items[0];
+                let secret = item.secret().await?;
+
+                if secret_only {
+                    if hex {
+                        println!("{}", hex::encode(secret.as_bytes()));
+                    } else {
+                        print!("{}", String::from_utf8_lossy(secret.as_bytes()));
+                    }
+                } else {
+                    let label = item.label().await?;
+                    let attrs = item.attributes().await?;
+
+                    println!("Label: {}", label);
+                    print!("Attributes:");
+                    for (k, v) in &attrs {
+                        print!(" {}={}", k, v);
+                    }
+                    println!();
+                    if hex {
+                        println!("Secret: {}", hex::encode(secret.as_bytes()));
+                    } else {
+                        println!("Secret: {}", String::from_utf8_lossy(secret.as_bytes()));
+                    }
+                }
+            }
+
+            Commands::DbusSet {
+                collection: collection_name,
+                label,
+                attributes,
+                replace,
+            } => {
+                let collection = if let Some(name) = collection_name {
+                    // Try alias first, then search by label
+                    if let Some(coll) = service.with_alias(&name).await? {
+                        coll
+                    } else {
+                        // Search by label
+                        let collections = service.collections().await?;
+                        let mut found_collection = None;
+                        for c in collections {
+                            if c.label().await.ok().as_ref() == Some(&name) {
+                                found_collection = Some(c);
+                                break;
+                            }
+                        }
+                        found_collection
+                            .ok_or_else(|| Error::Owned(format!("Collection '{}' not found", name)))?
+                    }
+                } else {
+                    service.default_collection().await?
+                };
+
+                // Unlock if needed
+                if collection.is_locked().await? {
+                    collection.unlock(None).await?;
+                }
+
+                // Read secret from stdin or prompt
+                let secret = if std::io::stdin().is_terminal() {
+                    print!("Secret: ");
+                    std::io::stdout().flush()?;
+                    let password = rpassword::read_password()
+                        .map_err(|_| Error::new("Failed to read secret"))?;
+                    oo7::Secret::text(&password)
+                } else {
+                    let mut buffer = String::new();
+                    std::io::stdin().read_line(&mut buffer)?;
+                    oo7::Secret::text(buffer.trim_end())
+                };
+
+                let attr_map: Vec<(&str, &str)> = attributes
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+
+                collection
+                    .create_item(&label, &attr_map, secret, replace, None)
+                    .await?;
+
+                println!("✓ Secret stored successfully");
+                println!("Label: {}", label);
+                print!("Attributes:");
+                for (k, v) in &attributes {
+                    print!(" {}={}", k, v);
+                }
+                println!();
+            }
         };
         Ok(())
     }

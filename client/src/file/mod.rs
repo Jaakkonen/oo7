@@ -122,6 +122,17 @@ impl Keyring {
         }
     }
 
+    /// Check if this keyring uses GPG encryption.
+    ///
+    /// Returns `true` if the keyring is encrypted with GPG, `false` if it uses
+    /// password-based encryption.
+    pub async fn is_gpg_encrypted(&self) -> bool {
+        match self {
+            Self::Locked(keyring) => keyring.is_gpg_encrypted().await,
+            Self::Unlocked(keyring) => keyring.is_gpg_encrypted().await,
+        }
+    }
+
     /// Get the creation timestamp from the filesystem if the keyring has an
     /// associated file.
     pub async fn created_time(&self) -> Option<std::time::Duration> {

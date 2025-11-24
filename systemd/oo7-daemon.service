@@ -1,0 +1,33 @@
+[Unit]
+Description=OO7 Secret Service (with GPG/Yubikey support)
+Documentation=https://github.com/bilelmoussaoui/oo7
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.secrets
+StandardError=journal
+ExecStart=%h/.cargo/bin/oo7-daemon
+Restart=on-failure
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+
+# Security settings
+NoNewPrivileges=true
+SupplementaryGroups=
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+
+# Allow GPG agent communication
+# Note: We need network access for Unix sockets, and device access for Yubikey
+PrivateNetwork=no
+PrivateDevices=no
+
+# Environment for GPG agent
+Environment="GPG_TTY=/dev/pts/0"
+
+[Install]
+WantedBy=default.target

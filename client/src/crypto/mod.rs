@@ -18,6 +18,8 @@ pub(crate) use self::openssl::*;
 #[cfg_attr(docsrs, doc(cfg(feature = "unstable")))]
 pub use self::openssl::*;
 
+pub mod gpg;
+
 #[cfg(test)]
 mod test {
     use super::*;

@@ -209,22 +209,64 @@ impl Service {
         &self,
         objects: Vec<OwnedObjectPath>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), ServiceError> {
-        let (unlocked, not_unlocked) = self.set_locked(false, &objects).await?;
-        if !not_unlocked.is_empty() {
+        // Try to unlock all objects first (works for already-unlocked and GPG keyrings)
+        let (unlocked, still_locked) = self.set_locked(false, &objects).await?;
+
+        // For items that are still locked, separate GPG from password-based
+        let mut gpg_locked = Vec::new();
+        let mut password_locked = Vec::new();
+
+        if !still_locked.is_empty() {
+            let collections = self.collections.lock().await;
+            for object in &still_locked {
+                if let Some(collection) = collections.get(object) {
+                    let keyring_guard = collection.keyring.read().await;
+                    let is_gpg = match keyring_guard.as_ref() {
+                        Some(kr) => kr.is_gpg_encrypted().await,
+                        None => false,
+                    };
+                    drop(keyring_guard);
+
+                    if is_gpg {
+                        gpg_locked.push(object.clone());
+                    } else {
+                        password_locked.push(object.clone());
+                    }
+                } else {
+                    // Not a collection (might be an item) - treat as password-based
+                    password_locked.push(object.clone());
+                }
+            }
+            drop(collections);
+        }
+
+        // GPG keyrings that are still locked after set_locked() failed - return error
+        if !gpg_locked.is_empty() {
+            return Err(custom_service_error(&format!(
+                "Failed to unlock {} GPG-encrypted collection(s)",
+                gpg_locked.len()
+            )));
+        }
+
+        // Create password prompt for password-based keyrings that are still locked
+        if !password_locked.is_empty() {
+            tracing::debug!("Creating password prompt for {} password-based collection(s)", password_locked.len());
+
             // Extract the label and collection before creating the prompt
-            let label = self.extract_label_from_objects(&not_unlocked).await;
-            let collection = self.extract_collection_from_objects(&not_unlocked).await;
+            let label = self.extract_label_from_objects(&password_locked).await;
+            let collection = self.extract_collection_from_objects(&password_locked).await;
 
             let prompt = Prompt::new(self.clone(), PromptRole::Unlock, label, collection).await;
             let path = OwnedObjectPath::from(prompt.path().clone());
 
             // Create the unlock action
             let service = self.clone();
+            let password_locked_for_action = password_locked.clone();
             let action = PromptAction::new(move |secret: Secret| async move {
                 // The prompter will handle secret validation
                 // Here we just perform the unlock operation
                 let collections = service.collections.lock().await;
-                for object in &not_unlocked {
+                for object in &password_locked_for_action {
                     // Try to find as collection first
                     if let Some(collection) = collections.get(object) {
                         let _ = collection.set_locked(false, Some(secret.clone())).await;
@@ -248,7 +290,7 @@ impl Service {
                         }
                     }
                 }
-                Ok(Value::new(not_unlocked).try_into_owned().unwrap())
+                Ok(Value::new(password_locked_for_action).try_into_owned().unwrap())
             });
 
             prompt.set_action(action).await;
@@ -389,7 +431,7 @@ impl Service {
 impl Service {
     const LOGIN_ALIAS: &str = "login";
 
-    pub async fn run(secret: Option<Secret>, request_replacement: bool) -> Result<(), Error> {
+    pub async fn run(secret: Option<Secret>, request_replacement: bool, config: crate::config::Config) -> Result<(), Error> {
         let service = Self::default();
 
         let connection = zbus::connection::Builder::session()?
@@ -404,10 +446,10 @@ impl Service {
             .await?;
 
         // Discover existing keyrings
-        let discovered_keyrings = service.discover_keyrings(secret).await?;
+        let discovered_keyrings = service.discover_keyrings(secret, &config).await?;
 
         service
-            .initialize(connection, discovered_keyrings, true)
+            .initialize(connection, discovered_keyrings, true, config)
             .await?;
 
         // Start PAM listener
@@ -449,7 +491,7 @@ impl Service {
         };
 
         service
-            .initialize(connection, default_keyring, false)
+            .initialize(connection, default_keyring, false, crate::config::Config::default())
             .await?;
         Ok(service)
     }
@@ -459,6 +501,7 @@ impl Service {
     pub(crate) async fn discover_keyrings(
         &self,
         secret: Option<Secret>,
+        config: &crate::config::Config,
     ) -> Result<Vec<(String, String, Keyring)>, Error> {
         let mut discovered = Vec::new();
 
@@ -498,7 +541,7 @@ impl Service {
                         tracing::debug!("Found v1 keyring: {name}");
 
                         // Try to load the keyring
-                        match self.load_keyring(&path, name, secret.as_ref()).await {
+                        match self.load_keyring(&path, name, secret.as_ref(), config).await {
                             Ok((label, alias, keyring)) => discovered.push((label, alias, keyring)),
                             Err(e) => tracing::warn!("Failed to load keyring {:?}: {}", path, e),
                         }
@@ -523,7 +566,7 @@ impl Service {
                         tracing::debug!("Found v0 keyring: {name}");
 
                         // Try to load the keyring
-                        match self.load_keyring(&path, name, secret.as_ref()).await {
+                        match self.load_keyring(&path, name, secret.as_ref(), config).await {
                             Ok((label, alias, keyring)) => discovered.push((label, alias, keyring)),
                             Err(e) => tracing::warn!("Failed to load keyring {:?}: {}", path, e),
                         }
@@ -554,6 +597,7 @@ impl Service {
         path: &std::path::Path,
         name: &str,
         secret: Option<&Secret>,
+        config: &crate::config::Config,
     ) -> Result<(String, String, Keyring), Error> {
         let alias = if name.eq_ignore_ascii_case(Self::LOGIN_ALIAS) {
             oo7::dbus::Service::DEFAULT_COLLECTION.to_owned()
@@ -574,6 +618,22 @@ impl Service {
         let keyring = match LockedKeyring::load(path).await {
             Ok(locked_keyring) => {
                 // Successfully loaded as v1 keyring
+
+                // Check if this is a password-based keyring and if we should skip it
+                let is_gpg = locked_keyring.is_gpg_encrypted().await;
+
+                if config.disable_v1_keyrings && !is_gpg {
+                    tracing::info!(
+                        "Skipping v1 password-based keyring '{}' at {:?} (disabled by config)",
+                        name,
+                        path
+                    );
+                    return Err(Error::File(oo7::file::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "v1 password-based keyrings are disabled in configuration",
+                    ))));
+                }
+
                 if let Some(secret) = secret {
                     match locked_keyring.unlock(secret.clone()).await {
                         Ok(unlocked) => {
@@ -667,8 +727,11 @@ impl Service {
         connection: zbus::Connection,
         mut discovered_keyrings: Vec<(String, String, Keyring)>, // (name, alias, keyring)
         auto_create_default: bool,
+        config: crate::config::Config,
     ) -> Result<(), Error> {
-        self.connection.set(connection.clone()).unwrap();
+        self.connection
+            .set(connection.clone())
+            .expect("Service already initialized - initialize() called twice");
 
         let object_server = connection.object_server();
         let mut collections = self.collections.lock().await;
@@ -679,21 +742,72 @@ impl Service {
         });
 
         if !has_default && auto_create_default {
-            tracing::info!("No default collection found, creating 'Login' keyring");
+            let use_gpg = config.login_keyring.use_gpg;
 
-            let locked_keyring = LockedKeyring::open(Self::LOGIN_ALIAS)
-                .await
-                .inspect_err(|e| {
-                    tracing::error!("Failed to create default Login keyring: {}", e);
-                })?;
+            if use_gpg {
+                let gpg_key_id = config.login_keyring.gpg_key_id.as_ref()
+                    .ok_or_else(|| Error::IO(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "GPG encryption enabled but no GPG key ID specified"
+                    )))?;
 
-            discovered_keyrings.push((
-                "Login".to_owned(),
-                oo7::dbus::Service::DEFAULT_COLLECTION.to_owned(),
-                Keyring::Locked(locked_keyring),
-            ));
+                tracing::info!("No default collection found, creating GPG-encrypted 'Login' keyring with key {}", gpg_key_id);
 
-            tracing::info!("Created default 'Login' collection (locked)");
+                // Create a temporary password-based keyring with a random password
+                // This password is only used briefly before migration to GPG
+                let temp_password = oo7::Secret::random()
+                    .map_err(|e| Error::IO(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to generate random password: {}", e)
+                    )))?;
+                let unlocked_keyring = UnlockedKeyring::open(Self::LOGIN_ALIAS, temp_password.clone())
+                    .await
+                    .inspect_err(|e| {
+                        tracing::error!("Failed to create temporary Login keyring: {}", e);
+                    })?;
+
+                // Migrate to GPG encryption
+                tracing::info!("Migrating Login keyring to GPG encryption (may prompt for Yubikey PIN)...");
+                unlocked_keyring.migrate_to_gpg(gpg_key_id)
+                    .await
+                    .inspect_err(|e| {
+                        tracing::error!("Failed to migrate Login keyring to GPG: {}", e);
+                    })?;
+
+                // Save the GPG-encrypted keyring
+                unlocked_keyring.write()
+                    .await
+                    .inspect_err(|e| {
+                        tracing::error!("Failed to save GPG-encrypted Login keyring: {}", e);
+                    })?;
+
+                // Lock it
+                let locked_keyring = unlocked_keyring.lock();
+
+                discovered_keyrings.push((
+                    "Login".to_owned(),
+                    oo7::dbus::Service::DEFAULT_COLLECTION.to_owned(),
+                    Keyring::Locked(locked_keyring),
+                ));
+
+                tracing::info!("Created GPG-encrypted default 'Login' collection (locked)");
+            } else {
+                tracing::info!("No default collection found, creating password-based 'Login' keyring");
+
+                let locked_keyring = LockedKeyring::open(Self::LOGIN_ALIAS)
+                    .await
+                    .inspect_err(|e| {
+                        tracing::error!("Failed to create default Login keyring: {}", e);
+                    })?;
+
+                discovered_keyrings.push((
+                    "Login".to_owned(),
+                    oo7::dbus::Service::DEFAULT_COLLECTION.to_owned(),
+                    Keyring::Locked(locked_keyring),
+                ));
+
+                tracing::info!("Created password-based default 'Login' collection (locked)");
+            }
         }
 
         // Set up discovered collections
@@ -794,8 +908,30 @@ impl Service {
                         collection.set_locked(true, None).await?;
                         without_prompt.push(object.clone());
                     } else {
-                        // Unlocking may require a prompt
-                        with_prompt.push(object.clone());
+                        // Unlocking - check if GPG-encrypted (can be unlocked without prompt)
+                        let keyring_guard = collection.keyring.read().await;
+                        let is_gpg = match keyring_guard.as_ref() {
+                            Some(kr) => kr.is_gpg_encrypted().await,
+                            None => false,
+                        };
+                        drop(keyring_guard);
+
+                        if is_gpg {
+                            // Try GPG unlock directly (will trigger Yubikey interaction)
+                            match collection.set_locked(false, None).await {
+                                Ok(()) => {
+                                    tracing::info!("GPG collection {} unlocked successfully", object);
+                                    without_prompt.push(object.clone());
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to unlock GPG collection {}: {}", object, e);
+                                    with_prompt.push(object.clone());
+                                }
+                            }
+                        } else {
+                            // Password-based - requires a prompt
+                            with_prompt.push(object.clone());
+                        }
                     }
                     break;
                 } else if let Some(item) = collection.item_from_path(object).await {
@@ -828,7 +964,9 @@ impl Service {
     }
 
     pub fn connection(&self) -> &zbus::Connection {
-        self.connection.get().unwrap()
+        self.connection
+            .get()
+            .expect("Service not initialized - connection() called before initialize()")
     }
 
     pub fn object_server(&self) -> &zbus::ObjectServer {

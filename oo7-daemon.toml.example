@@ -1,0 +1,31 @@
+# OO7 Daemon Configuration Example
+#
+# This file should be placed at:
+#   - /etc/oo7-daemon/config.toml (system-wide)
+#   - $XDG_CONFIG_HOME/oo7-daemon/config.toml (user-specific)
+#   - $HOME/.config/oo7-daemon/config.toml (fallback)
+
+[login_keyring]
+# Enable GPG encryption for the default Login keyring
+#
+# When enabled, the Login keyring will be encrypted with your GPG key
+# instead of a password. This allows hardware tokens (like Yubikey) to
+# be used for unlocking the keyring.
+#
+# Default: false
+use_gpg = false
+
+# GPG key ID to use for encrypting the Login keyring
+#
+# This should be the fingerprint or key ID of a GPG key that is available
+# in your GPG keyring. The key must be accessible for encryption operations.
+#
+# You can find your GPG key ID with: gpg --list-secret-keys --keyid-format LONG
+#
+# Example values:
+#   - Full fingerprint: "FDB4FF661951A129FF2DEEBFC5550EB2423FCEBC"
+#   - Short key ID: "0x1234567890ABCDEF"
+#   - Email: "your-email@example.com"
+#
+# This field is required if use_gpg = true
+# gpg_key_id = "YOUR_GPG_KEY_ID_HERE"

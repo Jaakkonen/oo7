@@ -7,6 +7,8 @@ pub enum Error {
     PadError(cipher::inout::PadError),
     #[cfg(feature = "native_crypto")]
     UnpadError(cipher::block_padding::UnpadError),
+    Gpg(gpgme::Error),
+    GpgIo(std::io::Error),
 }
 
 #[cfg(feature = "openssl_crypto")]
@@ -30,6 +32,18 @@ impl From<cipher::inout::PadError> for Error {
     }
 }
 
+impl From<gpgme::Error> for Error {
+    fn from(value: gpgme::Error) -> Self {
+        Self::Gpg(value)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::GpgIo(value)
+    }
+}
+
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -37,6 +51,8 @@ impl std::error::Error for Error {
             Self::Openssl(e) => Some(e),
             #[cfg(feature = "native_crypto")]
             Self::UnpadError(_) | Self::PadError(_) => None,
+            Self::Gpg(e) => Some(e),
+            Self::GpgIo(e) => Some(e),
         }
     }
 }
@@ -50,6 +66,8 @@ impl std::fmt::Display for Error {
             Self::UnpadError(e) => f.write_fmt(format_args!("Wrong padding error: {e}")),
             #[cfg(feature = "native_crypto")]
             Self::PadError(e) => f.write_fmt(format_args!("Wrong padding error: {e}")),
+            Self::Gpg(e) => f.write_fmt(format_args!("GPG error: {e}")),
+            Self::GpgIo(e) => f.write_fmt(format_args!("GPG I/O error: {e}")),
         }
     }
 }

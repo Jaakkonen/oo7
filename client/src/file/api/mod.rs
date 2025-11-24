@@ -53,6 +53,16 @@ use crate::{
     file::{Error, UnlockedItem, WeakKeyError},
 };
 
+/// GPG encryption configuration
+/// When present, indicates the keyring uses GPG-wrapped encryption
+#[derive(Deserialize, Serialize, Type, Debug, Clone)]
+pub struct GpgConfig {
+    /// GPG key fingerprint or ID
+    pub gpg_key_id: String,
+    /// Master symmetric key encrypted with GPG public key
+    pub encrypted_master_key: Vec<u8>,
+}
+
 pub(crate) fn data_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
         .and_then(|h| if h.is_empty() { None } else { Some(h) })
@@ -78,6 +88,11 @@ pub struct Keyring {
     modified_time: u64,
     usage_count: u32,
     pub(in crate::file) items: Vec<EncryptedItem>,
+    /// GPG encryption configuration
+    /// None means password-based encryption (for backward compatibility)
+    /// Some means GPG-wrapped encryption
+    #[serde(default)]
+    pub(in crate::file) gpg_config: Option<GpgConfig>,
 }
 
 impl Keyring {
@@ -96,6 +111,7 @@ impl Keyring {
                 .as_secs(),
             usage_count: 0,
             items: Vec::new(),
+            gpg_config: None, // Default to password-based encryption
         }
     }
 
@@ -109,6 +125,42 @@ impl Keyring {
         } else {
             Ok(())
         }
+    }
+
+    /// Validates that a key can decrypt this keyring.
+    ///
+    /// This method attempts to decrypt all items with the provided key and returns:
+    /// - `Ok(())` if the key is valid (can decrypt all items, or majority of items)
+    /// - `Err(Error::IncorrectSecret)` if no items can be decrypted
+    /// - `Err(Error::PartiallyCorruptedKeyring)` if more items fail than succeed
+    pub(crate) fn validate_key(&self, key: &Key) -> Result<(), Error> {
+        let mut n_broken_items = 0;
+        let mut n_valid_items = 0;
+
+        for encrypted_item in &self.items {
+            if encrypted_item.clone().decrypt(key).is_err() {
+                n_broken_items += 1;
+            } else {
+                n_valid_items += 1;
+            }
+        }
+
+        if n_valid_items == 0 && n_broken_items != 0 {
+            #[cfg(feature = "tracing")]
+            tracing::error!("Keyring cannot be decrypted. Invalid key.");
+            return Err(Error::IncorrectSecret);
+        } else if n_broken_items > n_valid_items {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "The keyring contains {n_broken_items} broken items and {n_valid_items} valid ones."
+            );
+            return Err(Error::PartiallyCorruptedKeyring {
+                valid_items: n_valid_items,
+                broken_items: n_broken_items,
+            });
+        }
+
+        Ok(())
     }
 
     /// Write to a keyring file
@@ -316,6 +368,7 @@ impl Keyring {
         self.iteration_count = DEFAULT_ITERATION_COUNT;
         self.usage_count = 0;
         self.items = Vec::new();
+        self.gpg_config = None;
     }
 }
 
