@@ -8,6 +8,7 @@ mod i18n;
 mod item;
 mod pam_listener;
 mod prompt;
+mod secret_provider;
 mod service;
 mod session;
 #[cfg(test)]

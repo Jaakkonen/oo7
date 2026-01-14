@@ -28,7 +28,7 @@ pub struct UnlockedItem {
 impl UnlockedItem {
     pub(crate) fn new(
         label: impl ToString,
-        attributes: &impl AsAttributes,
+        attributes: &(impl AsAttributes + ?Sized),
         secret: impl Into<Secret>,
     ) -> Self {
         let now = std::time::SystemTime::UNIX_EPOCH

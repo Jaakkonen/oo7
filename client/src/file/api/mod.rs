@@ -237,7 +237,7 @@ impl Keyring {
 
     pub fn search_items(
         &self,
-        attributes: &impl AsAttributes,
+        attributes: &(impl AsAttributes + ?Sized),
         key: &Key,
     ) -> Result<Vec<UnlockedItem>, Error> {
         let hashed_search = attributes.hash(key);
@@ -255,7 +255,7 @@ impl Keyring {
 
     pub fn lookup_item(
         &self,
-        attributes: &impl AsAttributes,
+        attributes: &(impl AsAttributes + ?Sized),
         key: &Key,
     ) -> Result<Option<UnlockedItem>, Error> {
         let hashed_search = attributes.hash(key);
@@ -271,7 +271,7 @@ impl Keyring {
             .transpose()
     }
 
-    pub fn lookup_item_index(&self, attributes: &impl AsAttributes, key: &Key) -> Option<usize> {
+    pub fn lookup_item_index(&self, attributes: &(impl AsAttributes + ?Sized), key: &Key) -> Option<usize> {
         let hashed_search = attributes.hash(key);
 
         self.items.iter().position(|e| {
@@ -281,7 +281,7 @@ impl Keyring {
         })
     }
 
-    pub fn remove_items(&mut self, attributes: &impl AsAttributes, key: &Key) -> Result<(), Error> {
+    pub fn remove_items(&mut self, attributes: &(impl AsAttributes + ?Sized), key: &Key) -> Result<(), Error> {
         let hashed_search = attributes.hash(key);
 
         let (remove, keep): (Vec<EncryptedItem>, _) =

@@ -1444,6 +1444,7 @@ dependencies = [
  "async-fs",
  "async-io",
  "async-lock",
+ "async-trait",
  "blocking",
  "cbc",
  "cipher",
@@ -1493,6 +1494,7 @@ name = "oo7-daemon"
 version = "0.6.0"
 dependencies = [
  "ashpd",
+ "async-trait",
  "base64",
  "caps",
  "clap",

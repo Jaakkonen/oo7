@@ -48,6 +48,10 @@ pub enum Error {
     Locked,
     /// Keyring is not GPG-encrypted
     NotGpgEncrypted,
+    /// User dismissed the unlock prompt
+    PromptDismissed,
+    /// Operation not supported for non-password-based keyrings
+    NotPasswordBased,
 }
 
 impl From<zvariant::Error> for Error {
@@ -129,6 +133,10 @@ impl std::fmt::Display for Error {
             Self::Crypto(e) => write!(f, "Failed to do a cryptography operation, {e}"),
             Self::Locked => write!(f, "Keyring or item is locked"),
             Self::NotGpgEncrypted => write!(f, "Keyring is not GPG-encrypted"),
+            Self::PromptDismissed => write!(f, "User dismissed the unlock prompt"),
+            Self::NotPasswordBased => {
+                write!(f, "Operation not supported for non-password-based keyrings")
+            }
         }
     }
 }

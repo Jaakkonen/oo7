@@ -9,6 +9,8 @@ pub enum Error {
     UnpadError(cipher::block_padding::UnpadError),
     Gpg(gpgme::Error),
     GpgIo(std::io::Error),
+    /// No decryption key is available.
+    NoKey,
 }
 
 #[cfg(feature = "openssl_crypto")]
@@ -53,6 +55,7 @@ impl std::error::Error for Error {
             Self::UnpadError(_) | Self::PadError(_) => None,
             Self::Gpg(e) => Some(e),
             Self::GpgIo(e) => Some(e),
+            Self::NoKey => None,
         }
     }
 }
@@ -68,6 +71,7 @@ impl std::fmt::Display for Error {
             Self::PadError(e) => f.write_fmt(format_args!("Wrong padding error: {e}")),
             Self::Gpg(e) => f.write_fmt(format_args!("GPG error: {e}")),
             Self::GpgIo(e) => f.write_fmt(format_args!("GPG I/O error: {e}")),
+            Self::NoKey => f.write_str("No decryption key available"),
         }
     }
 }

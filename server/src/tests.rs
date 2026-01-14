@@ -170,8 +170,9 @@ impl TestServiceSetup {
             )
             .await?;
 
-        let discovered = service.discover_keyrings(secret.clone()).await?;
-        service.initialize(server_conn, discovered, false, crate::config::Config::default()).await?;
+        let config = crate::config::Config::default();
+        let discovered = service.discover_keyrings(secret.clone(), &config).await?;
+        service.initialize(server_conn, discovered, false, config).await?;
 
         let mock_prompter = MockPrompterService::new();
         client_conn

@@ -281,7 +281,7 @@ impl UnlockedKeyring {
 
     /// Search items matching the attributes.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, attributes)))]
-    pub async fn search_items(&self, attributes: &impl AsAttributes) -> Result<Vec<Item>, Error> {
+    pub async fn search_items<A: AsAttributes + ?Sized>(&self, attributes: &A) -> Result<Vec<Item>, Error> {
         let key = self.derive_key().await?;
         let keyring = self.keyring.read().await;
         let results = keyring
@@ -298,7 +298,7 @@ impl UnlockedKeyring {
 
     /// Find the first item matching the attributes.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, attributes)))]
-    pub async fn lookup_item(&self, attributes: &impl AsAttributes) -> Result<Option<Item>, Error> {
+    pub async fn lookup_item<A: AsAttributes + ?Sized>(&self, attributes: &A) -> Result<Option<Item>, Error> {
         let key = self.derive_key().await?;
         let keyring = self.keyring.read().await;
 
@@ -310,9 +310,9 @@ impl UnlockedKeyring {
     /// Find the index in the list of items of the first item matching the
     /// attributes.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, attributes)))]
-    pub async fn lookup_item_index(
+    pub async fn lookup_item_index<A: AsAttributes + ?Sized>(
         &self,
-        attributes: &impl AsAttributes,
+        attributes: &A,
     ) -> Result<Option<usize>, Error> {
         let key = self.derive_key().await?;
         let keyring = self.keyring.read().await;
@@ -322,7 +322,7 @@ impl UnlockedKeyring {
 
     /// Delete an item.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, attributes)))]
-    pub async fn delete(&self, attributes: &impl AsAttributes) -> Result<(), Error> {
+    pub async fn delete<A: AsAttributes + ?Sized>(&self, attributes: &A) -> Result<(), Error> {
         #[cfg(feature = "tracing")]
         let items_before = { self.keyring.read().await.items.len() };
 
@@ -355,10 +355,10 @@ impl UnlockedKeyring {
     /// * `replace` - Whether to replace the value if the `attributes` matches
     ///   an existing `secret`.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, secret, attributes), fields(replace = replace)))]
-    pub async fn create_item(
+    pub async fn create_item<A: AsAttributes + ?Sized>(
         &self,
         label: &str,
-        attributes: &impl AsAttributes,
+        attributes: &A,
         secret: impl Into<Secret>,
         replace: bool,
     ) -> Result<Item, Error> {

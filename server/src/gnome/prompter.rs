@@ -364,23 +364,41 @@ impl PrompterCallback {
                     ));
                 };
 
-                // Get the collection to validate the secret
-                let collection = prompt.collection().expect("Unlock requires a collection");
+                // Get the collection to validate the secret (if available)
                 let label = prompt.label();
 
                 // Validate the secret using the already-open keyring
-                let keyring_guard = collection.keyring.read().await;
-                let is_valid = keyring_guard
-                    .as_ref()
-                    .unwrap()
-                    .validate_secret(&secret)
-                    .await
-                    .map_err(|err| {
-                        custom_service_error(&format!(
-                            "Failed to validate secret for {label} keyring: {err}."
-                        ))
-                    })?;
-                drop(keyring_guard);
+                // Note: During begin_unlock() flow, the keyring may have been taken out
+                // of the collection, or the collection may not be set at all (deferred
+                // secret provider). In these cases, skip validation here - the
+                // begin_unlock() task will do its own validation.
+                let is_valid = if let Some(collection) = prompt.collection() {
+                    let keyring_guard = collection.keyring.read().await;
+                    match keyring_guard.as_ref() {
+                        Some(keyring) => keyring
+                            .validate_secret(&secret)
+                            .await
+                            .map_err(|err| {
+                                custom_service_error(&format!(
+                                    "Failed to validate secret for {label} keyring: {err}."
+                                ))
+                            })?,
+                        None => {
+                            // Keyring is temporarily unavailable (begin_unlock in progress)
+                            tracing::debug!(
+                                "Keyring not available for validation, delegating to action"
+                            );
+                            true
+                        }
+                    }
+                } else {
+                    // Collection not set (deferred secret provider)
+                    // The action will handle validation through the begin_unlock flow
+                    tracing::debug!(
+                        "Collection not available for validation, delegating to action"
+                    );
+                    true
+                };
 
                 if is_valid {
                     tracing::debug!("Keyring secret matches for {label}.");

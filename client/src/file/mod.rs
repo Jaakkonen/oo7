@@ -29,14 +29,27 @@ pub(crate) mod api;
 pub(crate) use api::AttributeValue;
 
 mod error;
+mod gpg_keyring;
+mod loader;
 mod locked_item;
 mod locked_keyring;
+mod password_keyring;
+mod traits;
 mod unlocked_item;
 mod unlocked_keyring;
 
 pub use error::{Error, InvalidItemError, WeakKeyError};
+pub use gpg_keyring::{GpgLockedKeyring, GpgUnlockedKeyring};
+pub use loader::{is_gpg_encrypted, load_keyring};
 pub use locked_item::LockedItem;
 pub use locked_keyring::LockedKeyring;
+pub use password_keyring::{PasswordLockedKeyring, PasswordUnlockedKeyring};
+#[cfg(feature = "tokio")]
+pub use traits::BeginUnlockResult;
+pub use traits::{
+    LockedKeyring as LockedKeyringTrait, SecretProvider, UnlockNotifier,
+    UnlockedKeyring as UnlockedKeyringTrait,
+};
 pub use unlocked_item::UnlockedItem;
 pub use unlocked_keyring::UnlockedKeyring;
 

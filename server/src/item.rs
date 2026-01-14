@@ -374,6 +374,8 @@ impl Item {
         &self.path
     }
 
+    /// Legacy method - use `set_locked_trait` for trait-based keyrings
+    #[allow(dead_code)]
     pub(crate) async fn set_locked(
         &self,
         locked: bool,
@@ -391,6 +393,58 @@ impl Item {
                 }
                 (oo7::file::Item::Locked(locked_item), false) => {
                     let unlocked = keyring.unlock_item(locked_item).await.map_err(|err| {
+                        custom_service_error(&format!("Failed to unlock item: {err}"))
+                    })?;
+                    oo7::file::Item::Unlocked(unlocked)
+                }
+                (other, _) => other,
+            };
+            *inner_guard = Some(new_item);
+        }
+
+        drop(inner_guard);
+
+        let signal_emitter = self.service.signal_emitter(&self.path)?;
+        self.locked_changed(&signal_emitter).await?;
+
+        let signal_emitter = self.service.signal_emitter(&self.collection_path)?;
+        Collection::item_changed(&signal_emitter, &self.path).await?;
+
+        tracing::debug!(
+            "Item: {} is {}.",
+            self.path,
+            if locked { "locked" } else { "unlocked" }
+        );
+
+        Ok(())
+    }
+
+    /// Set the locked state using the new trait-based keyring.
+    ///
+    /// This method works with `&dyn UnlockedKeyringTrait` for polymorphic keyring handling.
+    pub(crate) async fn set_locked_trait(
+        &self,
+        locked: bool,
+        keyring: &dyn oo7::file::UnlockedKeyringTrait,
+    ) -> Result<(), ServiceError> {
+        let mut inner_guard = self.inner.lock().await;
+
+        if let Some(old_item) = inner_guard.take() {
+            let key = keyring.key().await.map_err(|err| {
+                custom_service_error(&format!("Failed to get key: {err}"))
+            })?;
+
+            let new_item = match (old_item, locked) {
+                (oo7::file::Item::Unlocked(unlocked), true) => {
+                    // Lock the item using the public lock method
+                    let locked_item = unlocked.lock(&key).map_err(|err| {
+                        custom_service_error(&format!("Failed to lock item: {err}"))
+                    })?;
+                    oo7::file::Item::Locked(locked_item)
+                }
+                (oo7::file::Item::Locked(locked_item), false) => {
+                    // Unlock the item using the public unlock method
+                    let unlocked = locked_item.unlock(&key).map_err(|err| {
                         custom_service_error(&format!("Failed to unlock item: {err}"))
                     })?;
                     oo7::file::Item::Unlocked(unlocked)

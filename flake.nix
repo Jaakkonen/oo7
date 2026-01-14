@@ -48,8 +48,8 @@
             dbus
           ];
 
-          # Build only the server package with GPG encryption
-          cargoBuildFlags = [ "--package" "oo7-daemon" "--features" "gpg_encryption" ];
+          # Build only the server package
+          cargoBuildFlags = [ "--package" "oo7-daemon" ];
 
           # Skip tests during build (can be run separately)
           doCheck = false;
@@ -155,12 +155,12 @@ DBUSEOF
               pkill -u $(id -u) -f oo7-daemon || true
               sleep 1
               RUST_LOG=oo7_daemon=debug,oo7=debug \
-              cargo run --package oo7-daemon --features gpg_encryption -- --replace
+              cargo run --package oo7-daemon -- --replace
             }
 
             # Helper to run the test
             oo7-test() {
-              cargo run --example yubikey_test --features tokio,gpg_encryption
+              cargo run --example yubikey_test --features tokio
             }
 
             export -f oo7-dev-daemon

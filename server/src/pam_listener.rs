@@ -296,10 +296,17 @@ impl PamListener {
 
             // Re-acquire the lock to get the unlocked keyring
             let keyring_guard = collection.keyring.read().await;
-            let Some(oo7::file::Keyring::Unlocked(uk)) = keyring_guard.as_ref() else {
-                tracing::warn!("Collection {} is not unlocked", path);
+            let Some(keyring_state) = keyring_guard.as_ref() else {
+                tracing::warn!("Collection {} has no keyring", path);
                 continue;
             };
+
+            if keyring_state.is_locked() {
+                tracing::warn!("Collection {} is not unlocked", path);
+                continue;
+            }
+
+            let uk = keyring_state.as_unlocked();
 
             // Validate that the old password can decrypt items in the keyring
             let can_decrypt = match uk.validate_secret(old_secret).await {

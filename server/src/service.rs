@@ -11,7 +11,13 @@ use oo7::{
         Algorithm, ServiceError,
         api::{DBusSecretInner, Properties},
     },
-    file::{Keyring, LockedKeyring, UnlockedKeyring},
+    file::{
+        UnlockedKeyring,
+        PasswordLockedKeyring, PasswordUnlockedKeyring,
+        GpgLockedKeyring,
+        is_gpg_encrypted,
+        LockedKeyringTrait, UnlockedKeyringTrait,
+    },
 };
 use tokio::sync::{Mutex, RwLock};
 use tokio_stream::StreamExt;
@@ -23,9 +29,10 @@ use zbus::{
 };
 
 use crate::{
-    collection::Collection,
+    collection::{Collection, KeyringState},
     error::{Error, custom_service_error},
     prompt::{Prompt, PromptAction, PromptRole},
+    secret_provider::GnomeSecretProvider,
     session::Session,
 };
 
@@ -209,67 +216,40 @@ impl Service {
         &self,
         objects: Vec<OwnedObjectPath>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), ServiceError> {
-        // Try to unlock all objects first (works for already-unlocked and GPG keyrings)
+        // Try to unlock all objects first
+        // - GPG keyrings unlock immediately
+        // - Password keyrings return "needs prompt" error and stay in still_locked
         let (unlocked, still_locked) = self.set_locked(false, &objects).await?;
 
-        // For items that are still locked, separate GPG from password-based
-        let mut gpg_locked = Vec::new();
-        let mut password_locked = Vec::new();
+        // All still_locked objects need a password prompt
+        // (GPG keyrings that fail to unlock cause set_locked to return an error)
 
+        // Create password prompt for keyrings that are still locked
         if !still_locked.is_empty() {
-            let collections = self.collections.lock().await;
-            for object in &still_locked {
-                if let Some(collection) = collections.get(object) {
-                    let keyring_guard = collection.keyring.read().await;
-                    let is_gpg = match keyring_guard.as_ref() {
-                        Some(kr) => kr.is_gpg_encrypted().await,
-                        None => false,
-                    };
-                    drop(keyring_guard);
-
-                    if is_gpg {
-                        gpg_locked.push(object.clone());
-                    } else {
-                        password_locked.push(object.clone());
-                    }
-                } else {
-                    // Not a collection (might be an item) - treat as password-based
-                    password_locked.push(object.clone());
-                }
-            }
-            drop(collections);
-        }
-
-        // GPG keyrings that are still locked after set_locked() failed - return error
-        if !gpg_locked.is_empty() {
-            return Err(custom_service_error(&format!(
-                "Failed to unlock {} GPG-encrypted collection(s)",
-                gpg_locked.len()
-            )));
-        }
-
-        // Create password prompt for password-based keyrings that are still locked
-        if !password_locked.is_empty() {
-            tracing::debug!("Creating password prompt for {} password-based collection(s)", password_locked.len());
+            tracing::debug!("Creating password prompt for {} collection(s)", still_locked.len());
 
             // Extract the label and collection before creating the prompt
-            let label = self.extract_label_from_objects(&password_locked).await;
-            let collection = self.extract_collection_from_objects(&password_locked).await;
+            let label = self.extract_label_from_objects(&still_locked).await;
+            let collection = self.extract_collection_from_objects(&still_locked).await;
 
             let prompt = Prompt::new(self.clone(), PromptRole::Unlock, label, collection).await;
             let path = OwnedObjectPath::from(prompt.path().clone());
 
             // Create the unlock action
             let service = self.clone();
-            let password_locked_for_action = password_locked.clone();
+            let locked_objects = still_locked.clone();
             let action = PromptAction::new(move |secret: Secret| async move {
                 // The prompter will handle secret validation
                 // Here we just perform the unlock operation
                 let collections = service.collections.lock().await;
-                for object in &password_locked_for_action {
+                for object in &locked_objects {
                     // Try to find as collection first
                     if let Some(collection) = collections.get(object) {
-                        let _ = collection.set_locked(false, Some(secret.clone())).await;
+                        if let Err(e) = collection.set_locked(false, Some(secret.clone())).await {
+                            tracing::error!("Failed to unlock collection {}: {}", object, e);
+                        } else {
+                            tracing::info!("Unlocked collection {} via prompt", object);
+                        }
                     } else {
                         // Try to find as item within collections
                         for (_path, collection) in collections.iter() {
@@ -282,7 +262,7 @@ impl Service {
                                     // Collection is already unlocked, just unlock the item
                                     let keyring = collection.keyring.read().await;
                                     let _ = item
-                                        .set_locked(false, keyring.as_ref().unwrap().as_unlocked())
+                                        .set_locked_trait(false, keyring.as_ref().unwrap().as_unlocked())
                                         .await;
                                 }
                                 break;
@@ -290,7 +270,7 @@ impl Service {
                         }
                     }
                 }
-                Ok(Value::new(password_locked_for_action).try_into_owned().unwrap())
+                Ok(Value::new(locked_objects).try_into_owned().unwrap())
             });
 
             prompt.set_action(action).await;
@@ -480,11 +460,22 @@ impl Service {
             )
             .await?;
 
-        let default_keyring = if let Some(secret) = secret {
+        let default_keyring = if let Some(ref secret) = secret {
+            // Create a secret provider that can handle prompts (for test unlock scenarios)
+            let secret_provider = std::sync::Arc::new(
+                GnomeSecretProvider::new_deferred(service.clone(), "Login")
+            );
+
+            // Create a temporary password keyring with the proper provider
+            let unlocked = PasswordUnlockedKeyring::temporary_with_provider(
+                secret.clone(),
+                secret_provider,
+            ).await?;
+
             vec![(
                 "Login".to_owned(),
                 oo7::dbus::Service::DEFAULT_COLLECTION.to_owned(),
-                Keyring::Unlocked(UnlockedKeyring::temporary(secret).await?),
+                KeyringState::Unlocked(Box::new(unlocked)),
             )]
         } else {
             vec![]
@@ -497,12 +488,12 @@ impl Service {
     }
 
     /// Discover existing keyrings in the data directory
-    /// Returns a vector of (label, alias, keyring) tuples
+    /// Returns a vector of (label, alias, keyring_state) tuples
     pub(crate) async fn discover_keyrings(
         &self,
         secret: Option<Secret>,
         config: &crate::config::Config,
-    ) -> Result<Vec<(String, String, Keyring)>, Error> {
+    ) -> Result<Vec<(String, String, KeyringState)>, Error> {
         let mut discovered = Vec::new();
 
         // Get data directory using the same logic as oo7::file::api::data_dir()
@@ -591,14 +582,17 @@ impl Service {
     }
 
     /// Load a single keyring from a file path
-    /// Returns (label, alias, keyring)
+    /// Returns (label, alias, keyring_state)
+    ///
+    /// This function detects the keyring type (GPG vs password) and loads
+    /// the appropriate trait implementation.
     async fn load_keyring(
         &self,
         path: &std::path::Path,
         name: &str,
         secret: Option<&Secret>,
         config: &crate::config::Config,
-    ) -> Result<(String, String, Keyring), Error> {
+    ) -> Result<(String, String, KeyringState), Error> {
         let alias = if name.eq_ignore_ascii_case(Self::LOGIN_ALIAS) {
             oo7::dbus::Service::DEFAULT_COLLECTION.to_owned()
         } else {
@@ -614,110 +608,158 @@ impl Service {
             }
         };
 
-        // Try to load the keyring
-        let keyring = match LockedKeyring::load(path).await {
-            Ok(locked_keyring) => {
-                // Successfully loaded as v1 keyring
-
-                // Check if this is a password-based keyring and if we should skip it
-                let is_gpg = locked_keyring.is_gpg_encrypted().await;
-
-                if config.disable_v1_keyrings && !is_gpg {
-                    tracing::info!(
-                        "Skipping v1 password-based keyring '{}' at {:?} (disabled by config)",
-                        name,
-                        path
-                    );
-                    return Err(Error::File(oo7::file::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "v1 password-based keyrings are disabled in configuration",
-                    ))));
-                }
-
-                if let Some(secret) = secret {
-                    match locked_keyring.unlock(secret.clone()).await {
-                        Ok(unlocked) => {
-                            tracing::info!("Unlocked keyring '{}' from {:?}", name, path);
-                            Keyring::Unlocked(unlocked)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to unlock keyring '{}' with provided secret: {}. Keeping it locked.",
-                                name,
-                                e
-                            );
-                            // Reload as locked since unlock consumed it
-                            Keyring::Locked(LockedKeyring::load(path).await?)
-                        }
-                    }
-                } else {
-                    tracing::debug!("No secret provided, keeping keyring '{}' locked", name);
-                    Keyring::Locked(locked_keyring)
-                }
-            }
+        // First, try to detect keyring type using the helper
+        let is_gpg = match is_gpg_encrypted(path).await {
+            Ok(gpg) => gpg,
             Err(oo7::file::Error::VersionMismatch(Some(version)))
                 if version.first() == Some(&0) =>
-            // v0 is the legacy version
             {
                 // This is a v0 keyring that needs migration
-                tracing::info!(
-                    "Found legacy v0 keyring '{name}' at {}, registering for migration",
-                    path.display()
-                );
-
-                if let Some(secret) = secret {
-                    tracing::debug!("Attempting immediate migration of v0 keyring '{name}'",);
-                    match UnlockedKeyring::open(name, secret.clone()).await {
-                        Ok(unlocked) => {
-                            tracing::info!("Successfully migrated v0 keyring '{name}' to v1",);
-
-                            // Write the migrated keyring to disk
-                            unlocked.write().await?;
-                            tracing::info!("Wrote migrated keyring '{name}' to disk");
-
-                            // Remove the v0 keyring file after successful migration
-                            if let Err(e) = tokio::fs::remove_file(path).await {
-                                tracing::warn!(
-                                    "Failed to remove v0 keyring at {}: {e}",
-                                    path.display()
-                                );
-                            } else {
-                                tracing::info!("Removed v0 keyring file at {}", path.display());
-                            }
-
-                            Keyring::Unlocked(unlocked)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to migrate v0 keyring '{name}': {e}. Will retry when secret is available.",
-                            );
-                            self.pending_migrations.lock().await.insert(
-                                name.to_owned(),
-                                (path.to_path_buf(), label.clone(), alias.clone()),
-                            );
-                            return Err(e.into());
-                        }
-                    }
-                } else {
-                    tracing::debug!(
-                        "No secret available for v0 keyring '{}', registering for pending migration",
-                        name
-                    );
-                    self.pending_migrations.lock().await.insert(
-                        name.to_owned(),
-                        (path.to_path_buf(), label.clone(), alias.clone()),
-                    );
-                    return Err(Error::IO(std::io::Error::other(
-                        "v0 keyring requires migration, no secret available",
-                    )));
-                }
+                return self.handle_v0_migration(path, name, &label, &alias, secret).await;
             }
-            Err(e) => {
-                return Err(e.into());
+            Err(oo7::file::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File doesn't exist - this will be created as a new keyring
+                false
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // Check if password keyrings are disabled
+        if config.disable_v1_keyrings && !is_gpg {
+            tracing::info!(
+                "Skipping v1 password-based keyring '{}' at {:?} (disabled by config)",
+                name,
+                path
+            );
+            return Err(Error::File(oo7::file::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "v1 password-based keyrings are disabled in configuration",
+            ))));
+        }
+
+        // Load using the appropriate type based on encryption
+        let keyring = if is_gpg {
+            // GPG keyring - doesn't need a secret provider
+            tracing::debug!("Loading GPG-encrypted keyring '{}' from {:?}", name, path);
+            let locked = GpgLockedKeyring::load(path, &label, None).await?;
+
+            // GPG keyrings can be unlocked immediately via gpg-agent
+            if secret.is_some() {
+                // We have a secret but GPG keyrings use gpg-agent, try to unlock
+                match Box::new(locked).unlock().await {
+                    Ok(unlocked) => {
+                        tracing::info!("Unlocked GPG keyring '{}' via gpg-agent", name);
+                        KeyringState::Unlocked(unlocked)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to unlock GPG keyring '{}': {}. Keeping locked.", name, e);
+                        KeyringState::Locked(Box::new(GpgLockedKeyring::load(path, &label, None).await?))
+                    }
+                }
+            } else {
+                KeyringState::Locked(Box::new(locked))
+            }
+        } else {
+            // Password-based keyring - needs a secret provider for D-Bus prompts
+            tracing::debug!("Loading password-based keyring '{}' from {:?}", name, path);
+
+            // Create a deferred secret provider (collection will be set later)
+            let secret_provider = Arc::new(GnomeSecretProvider::new_deferred(self.clone(), &label));
+
+            let locked = PasswordLockedKeyring::load(path, &label, secret_provider.clone()).await?;
+
+            if let Some(secret) = secret {
+                // Try to unlock directly with the provided secret (bypasses the provider)
+                match locked.unlock_with_secret(secret).await {
+                    Ok(unlocked) => {
+                        tracing::info!("Unlocked password keyring '{}' with provided secret", name);
+                        KeyringState::Unlocked(Box::new(unlocked))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Secret invalid for keyring '{}': {}. Keeping locked.", name, e);
+                        // Reload since unlock_with_secret consumed it
+                        KeyringState::Locked(Box::new(
+                            PasswordLockedKeyring::load(path, &label, secret_provider).await?
+                        ))
+                    }
+                }
+            } else {
+                tracing::debug!("No secret provided, keeping keyring '{}' locked", name);
+                KeyringState::Locked(Box::new(locked))
             }
         };
 
         Ok((label, alias, keyring))
+    }
+
+    /// Handle v0 keyring migration
+    async fn handle_v0_migration(
+        &self,
+        path: &std::path::Path,
+        name: &str,
+        label: &str,
+        alias: &str,
+        secret: Option<&Secret>,
+    ) -> Result<(String, String, KeyringState), Error> {
+        tracing::info!(
+            "Found legacy v0 keyring '{name}' at {}, registering for migration",
+            path.display()
+        );
+
+        if let Some(secret) = secret {
+            tracing::debug!("Attempting immediate migration of v0 keyring '{name}'");
+
+            // Use old UnlockedKeyring::open for migration (it handles v0 internally)
+            match UnlockedKeyring::open(name, secret.clone()).await {
+                Ok(unlocked) => {
+                    tracing::info!("Successfully migrated v0 keyring '{name}' to v1");
+
+                    // Write the migrated keyring to disk
+                    unlocked.write().await?;
+                    tracing::info!("Wrote migrated keyring '{name}' to disk");
+
+                    // Remove the v0 keyring file after successful migration
+                    if let Err(e) = tokio::fs::remove_file(path).await {
+                        tracing::warn!("Failed to remove v0 keyring at {}: {e}", path.display());
+                    } else {
+                        tracing::info!("Removed v0 keyring file at {}", path.display());
+                    }
+
+                    // Now load the migrated keyring using the new types
+                    // The file is now v1 format, so use PasswordUnlockedKeyring
+                    let secret_provider = Arc::new(GnomeSecretProvider::new_deferred(self.clone(), label));
+                    let v1_path = unlocked.path().unwrap().to_path_buf();
+
+                    // Load as password keyring and immediately unlock with the known secret
+                    let loaded = PasswordLockedKeyring::load(&v1_path, label, secret_provider).await?;
+                    let unlocked_keyring = loaded.unlock_with_secret(secret).await?;
+
+                    Ok((label.to_string(), alias.to_string(), KeyringState::Unlocked(Box::new(unlocked_keyring))))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to migrate v0 keyring '{name}': {e}. Will retry when secret is available."
+                    );
+                    self.pending_migrations.lock().await.insert(
+                        name.to_owned(),
+                        (path.to_path_buf(), label.to_string(), alias.to_string()),
+                    );
+                    Err(e.into())
+                }
+            }
+        } else {
+            tracing::debug!(
+                "No secret available for v0 keyring '{}', registering for pending migration",
+                name
+            );
+            self.pending_migrations.lock().await.insert(
+                name.to_owned(),
+                (path.to_path_buf(), label.to_string(), alias.to_string()),
+            );
+            Err(Error::IO(std::io::Error::other(
+                "v0 keyring requires migration, no secret available",
+            )))
+        }
     }
 
     /// Initialize the service with collections and start client disconnect
@@ -725,7 +767,7 @@ impl Service {
     pub(crate) async fn initialize(
         &self,
         connection: zbus::Connection,
-        mut discovered_keyrings: Vec<(String, String, Keyring)>, // (name, alias, keyring)
+        mut discovered_keyrings: Vec<(String, String, KeyringState)>, // (name, alias, keyring)
         auto_create_default: bool,
         config: crate::config::Config,
     ) -> Result<(), Error> {
@@ -781,20 +823,39 @@ impl Service {
                         tracing::error!("Failed to save GPG-encrypted Login keyring: {}", e);
                     })?;
 
-                // Lock it
-                let locked_keyring = unlocked_keyring.lock();
+                // Reload as GpgLockedKeyring (the migration converted it to GPG format)
+                let keyring_path = unlocked_keyring.path().unwrap().to_path_buf();
+                let locked_keyring = GpgLockedKeyring::load(&keyring_path, "Login", None)
+                    .await
+                    .inspect_err(|e| {
+                        tracing::error!("Failed to reload GPG-encrypted Login keyring: {}", e);
+                    })?;
 
                 discovered_keyrings.push((
                     "Login".to_owned(),
                     oo7::dbus::Service::DEFAULT_COLLECTION.to_owned(),
-                    Keyring::Locked(locked_keyring),
+                    KeyringState::Locked(Box::new(locked_keyring)),
                 ));
 
                 tracing::info!("Created GPG-encrypted default 'Login' collection (locked)");
             } else {
                 tracing::info!("No default collection found, creating password-based 'Login' keyring");
 
-                let locked_keyring = LockedKeyring::open(Self::LOGIN_ALIAS)
+                // Create a deferred secret provider for the new keyring
+                let secret_provider = Arc::new(GnomeSecretProvider::new_deferred(self.clone(), "Login"));
+
+                // Get the keyring path using the same logic as api::Keyring::path()
+                let data_dir = std::env::var_os("XDG_DATA_HOME")
+                    .and_then(|h| if h.is_empty() { None } else { Some(h) })
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))
+                    .ok_or_else(|| Error::IO(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Could not determine data directory",
+                    )))?;
+                let keyring_path = data_dir.join("keyrings/v1").join(format!("{}.keyring", Self::LOGIN_ALIAS));
+
+                let locked_keyring = PasswordLockedKeyring::load(&keyring_path, "Login", secret_provider)
                     .await
                     .inspect_err(|e| {
                         tracing::error!("Failed to create default Login keyring: {}", e);
@@ -803,7 +864,7 @@ impl Service {
                 discovered_keyrings.push((
                     "Login".to_owned(),
                     oo7::dbus::Service::DEFAULT_COLLECTION.to_owned(),
-                    Keyring::Locked(locked_keyring),
+                    KeyringState::Locked(Box::new(locked_keyring)),
                 ));
 
                 tracing::info!("Created password-based default 'Login' collection (locked)");
@@ -832,7 +893,7 @@ impl Service {
             "session",
             oo7::dbus::Service::SESSION_COLLECTION,
             self.clone(),
-            Keyring::Unlocked(UnlockedKeyring::temporary(Secret::random().unwrap()).await?),
+            KeyringState::Unlocked(Box::new(PasswordUnlockedKeyring::temporary(Secret::random().unwrap()).await?)),
         )
         .await;
         object_server
@@ -908,29 +969,25 @@ impl Service {
                         collection.set_locked(true, None).await?;
                         without_prompt.push(object.clone());
                     } else {
-                        // Unlocking - check if GPG-encrypted (can be unlocked without prompt)
-                        let keyring_guard = collection.keyring.read().await;
-                        let is_gpg = match keyring_guard.as_ref() {
-                            Some(kr) => kr.is_gpg_encrypted().await,
-                            None => false,
-                        };
-                        drop(keyring_guard);
-
-                        if is_gpg {
-                            // Try GPG unlock directly (will trigger Yubikey interaction)
-                            match collection.set_locked(false, None).await {
-                                Ok(()) => {
-                                    tracing::info!("GPG collection {} unlocked successfully", object);
-                                    without_prompt.push(object.clone());
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to unlock GPG collection {}: {}", object, e);
+                        // Unlocking - try direct unlock (works for GPG keyrings)
+                        // Password keyrings will return an error requiring a prompt
+                        match collection.set_locked(false, None).await {
+                            Ok(()) => {
+                                tracing::info!("Collection {} unlocked successfully", object);
+                                without_prompt.push(object.clone());
+                            }
+                            Err(e) => {
+                                // Check if this is a password keyring that needs a prompt
+                                let err_msg = e.to_string();
+                                if err_msg.contains("Password keyring requires prompt") {
+                                    tracing::debug!("Collection {} requires password prompt", object);
+                                    with_prompt.push(object.clone());
+                                } else {
+                                    // Real error (e.g., GPG failure)
+                                    tracing::error!("Failed to unlock collection {}: {}", object, e);
                                     with_prompt.push(object.clone());
                                 }
                             }
-                        } else {
-                            // Password-based - requires a prompt
-                            with_prompt.push(object.clone());
                         }
                     }
                     break;
@@ -946,7 +1003,7 @@ impl Service {
                     // item directly
                     } else if !collection_locked {
                         let keyring = collection.keyring.read().await;
-                        item.set_locked(locked, keyring.as_ref().unwrap().as_unlocked())
+                        item.set_locked_trait(locked, keyring.as_ref().unwrap().as_unlocked())
                             .await?;
                         without_prompt.push(object.clone());
                     } else {
@@ -1054,7 +1111,7 @@ impl Service {
         };
 
         // Create a persistent keyring with the provided secret
-        let keyring = UnlockedKeyring::open(&label.to_lowercase(), secret)
+        let keyring = PasswordUnlockedKeyring::open(&label.to_lowercase(), secret)
             .await
             .map_err(|err| custom_service_error(&format!("Failed to create keyring: {err}")))?;
 
@@ -1064,7 +1121,7 @@ impl Service {
             .await
             .map_err(|err| custom_service_error(&format!("Failed to write keyring file: {err}")))?;
 
-        let keyring = Keyring::Unlocked(keyring);
+        let keyring = KeyringState::Unlocked(Box::new(keyring));
 
         // Create the collection
         let collection = Collection::new(&label, &alias, self.clone(), keyring).await;
@@ -1181,6 +1238,7 @@ impl Service {
         for (name, (path, label, alias)) in pending.iter() {
             tracing::debug!("Attempting to migrate pending v0 keyring: {}", name);
 
+            // Use old UnlockedKeyring::open for v0 migration, then convert to new type
             match UnlockedKeyring::open(name, secret.clone()).await {
                 Ok(unlocked) => {
                     tracing::info!("Successfully migrated v0 keyring '{}' to v1", name);
@@ -1207,8 +1265,17 @@ impl Service {
                         }
                     }
 
+                    // Load the newly migrated v1 file using new types
+                    let migrated_keyring = match PasswordUnlockedKeyring::open(name, secret.clone()).await {
+                        Ok(k) => k,
+                        Err(e) => {
+                            tracing::error!("Failed to load migrated keyring '{}': {}", name, e);
+                            continue;
+                        }
+                    };
+
                     // Create a collection for this migrated keyring
-                    let keyring = Keyring::Unlocked(unlocked);
+                    let keyring = KeyringState::Unlocked(Box::new(migrated_keyring));
                     let collection = Collection::new(label, alias, self.clone(), keyring).await;
                     let collection_path: OwnedObjectPath = collection.path().to_owned().into();
 
@@ -1406,7 +1473,7 @@ mod tests {
             .item_from_path(locked_item.inner().path())
             .await
             .unwrap();
-        locked_item.set_locked(true, unlocked_keyring).await?;
+        locked_item.set_locked_trait(true, unlocked_keyring).await?;
 
         // Search for items with the shared attribute
         let (unlocked, locked) = setup
@@ -1923,11 +1990,12 @@ mod tests {
     #[tokio::test]
     async fn unlock_collection_prompt() -> Result<(), Box<dyn std::error::Error>> {
         let setup = TestServiceSetup::plain_session(true).await?;
+        let default_collection = setup.default_collection().await?;
 
         // Lock the collection using server-side API
         let collection = setup
             .server
-            .collection_from_path(setup.collections[0].inner().path())
+            .collection_from_path(default_collection.inner().path())
             .await
             .expect("Collection should exist");
         collection
@@ -1935,24 +2003,24 @@ mod tests {
             .await?;
 
         assert!(
-            setup.collections[0].is_locked().await?,
+            default_collection.is_locked().await?,
             "Collection should be locked"
         );
 
         // Test 1: Unlock with accept
         let unlocked = setup
             .service_api
-            .unlock(&[setup.collections[0].inner().path()], None)
+            .unlock(&[default_collection.inner().path()], None)
             .await?;
 
         assert_eq!(unlocked.len(), 1, "Should have unlocked 1 collection");
         assert_eq!(
             unlocked[0].as_str(),
-            setup.collections[0].inner().path().as_str(),
+            default_collection.inner().path().as_str(),
             "Should return the collection path"
         );
         assert!(
-            !setup.collections[0].is_locked().await?,
+            !default_collection.is_locked().await?,
             "Collection should be unlocked after accepting prompt"
         );
 
@@ -1961,7 +2029,7 @@ mod tests {
             .set_locked(true, setup.keyring_secret.clone())
             .await?;
         assert!(
-            setup.collections[0].is_locked().await?,
+            default_collection.is_locked().await?,
             "Collection should be locked again"
         );
 
@@ -1969,7 +2037,7 @@ mod tests {
         setup.mock_prompter.set_accept(false).await;
         let result = setup
             .service_api
-            .unlock(&[setup.collections[0].inner().path()], None)
+            .unlock(&[default_collection.inner().path()], None)
             .await;
 
         assert!(
@@ -1977,7 +2045,7 @@ mod tests {
             "Should return Dismissed error when prompt dismissed"
         );
         assert!(
-            setup.collections[0].is_locked().await?,
+            default_collection.is_locked().await?,
             "Collection should still be locked after dismissing prompt"
         );
 
@@ -2389,7 +2457,8 @@ mod tests {
         tokio::fs::create_dir_all(&v1_dir).await?;
 
         // Test 1: Empty directory
-        let discovered = service.discover_keyrings(None).await?;
+        let config = crate::config::Config::default();
+        let discovered = service.discover_keyrings(None, &config).await?;
         assert!(
             discovered.is_empty(),
             "Should discover no keyrings in empty directory"
@@ -2440,7 +2509,7 @@ mod tests {
         tokio::fs::create_dir(v1_dir.join("subdir")).await?;
 
         // Test 2: Discover without any password, all should be locked
-        let discovered = service.discover_keyrings(None).await?;
+        let discovered = service.discover_keyrings(None, &config).await?;
         assert_eq!(discovered.len(), 3, "Should discover 3 keyrings");
         for (_, _, keyring) in &discovered {
             assert!(
@@ -2450,7 +2519,7 @@ mod tests {
         }
 
         // Test 3: Discover with one password, only that keyring should be unlocked
-        let discovered = service.discover_keyrings(Some(secret1.clone())).await?;
+        let discovered = service.discover_keyrings(Some(secret1.clone()), &config).await?;
         assert_eq!(discovered.len(), 3, "Should discover 3 keyrings");
 
         let work_keyring = discovered
@@ -2541,7 +2610,8 @@ mod tests {
         v1_keyring.write().await?;
 
         // Test 1: Discover without secret, v0 marked for migration, v1 locked
-        let discovered = service.discover_keyrings(None).await?;
+        let config = crate::config::Config::default();
+        let discovered = service.discover_keyrings(None, &config).await?;
         assert_eq!(discovered.len(), 1, "Should discover v1 keyring only");
         assert!(discovered[0].2.is_locked(), "V1 should be locked");
 
@@ -2552,7 +2622,7 @@ mod tests {
 
         // Test 2: Discover with v0 secret, v0 migrated, v1 locked
         service.pending_migrations.lock().await.clear();
-        let discovered = service.discover_keyrings(Some(v0_secret.clone())).await?;
+        let discovered = service.discover_keyrings(Some(v0_secret.clone()), &config).await?;
         assert_eq!(discovered.len(), 2, "Should discover both keyrings");
 
         let legacy = discovered.iter().find(|(l, _, _)| l == "Legacy").unwrap();
@@ -2575,7 +2645,7 @@ mod tests {
         tokio::fs::copy(&fixture_path, &v0_path).await?;
 
         let wrong_secret = Secret::from("wrong-password");
-        let discovered = service.discover_keyrings(Some(wrong_secret)).await?;
+        let discovered = service.discover_keyrings(Some(wrong_secret), &config).await?;
         assert_eq!(
             discovered.len(),
             1,

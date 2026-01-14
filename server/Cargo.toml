@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 ashpd = {workspace = true, features = ["backend", "tracing"]}
+async-trait = "0.1"
 base64 = "0.22"
 caps = "0.5"
 clap.workspace = true
