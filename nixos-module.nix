@@ -11,8 +11,8 @@ in
 
     package = mkOption {
       type = types.package;
-      default = oo7.packages.${pkgs.system}.oo7-daemon;
-      defaultText = literalExpression "oo7.packages.\${pkgs.system}.oo7-daemon";
+      default = oo7.packages.${pkgs.stdenv.hostPlatform.system}.oo7-daemon;
+      defaultText = literalExpression "oo7.packages.\${pkgs.stdenv.hostPlatform.system}.oo7-daemon";
       description = "The oo7-daemon package to use.";
     };
 
